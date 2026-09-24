@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import threading
 import time
 import traceback
@@ -23,16 +24,18 @@ __id__ = "av1_sw_decoder"
 __name__ = "AV1 Software Decoder"
 __description__ = (
     "Позволяет воспроизводить AV1-видео программным декодером "
-    "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
+    "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1. "
+    "Может также включать программный декодер для HEVC."
 )
 __author__ = "stxlvn"
-__version__ = "1.1.4"
+__version__ = "1.2.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
 
 AV1_CODECS = ("av1", "av01")
 AV1_MIME = "video/av01"
+HEVC_MIME = "video/hevc"
 UNSUPPORTED_PREF = "unsupport_" + AV1_MIME
 DAV1D_MARK = "dav1d"
 
@@ -47,6 +50,9 @@ LOG_URL = "https://stxlvn.tech/av1log"
 LOG_EVENTS_MAX = 400
 LOG_PAYLOAD_MAX = 200 * 1024
 LOG_DEDUPE_MAX = 200
+# Attribute on the shared `sys` module naming the live plugin instance: hooks left behind by
+# older instances (the app does not remove them on reinstall) see they are stale and do nothing.
+OWNER_ATTR = "_av1_sw_decoder_owner"
 PRIVATE_RE = re.compile(r"(tg://\S+|/storage/\S+|/data/\S+|file://\S+|https?://\S+)")
 
 
@@ -117,7 +123,7 @@ def filter_qualities(qualities, mode: int, max_p: int) -> bool:
     return True
 
 
-def scan_av1_decoders():
+def scan_decoders(mime):
     hw, sw = [], []
     try:
         infos = MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()
@@ -128,7 +134,7 @@ def scan_av1_decoders():
         try:
             if info.isEncoder():
                 continue
-            if not any(t.lower() == AV1_MIME for t in info.getSupportedTypes()):
+            if not any(t.lower() == mime for t in info.getSupportedTypes()):
                 continue
             name = info.getName()
             if sdk >= 29:
@@ -138,7 +144,7 @@ def scan_av1_decoders():
                 software = lname.startswith(("omx.google.", "c2.android.", "c2.google.")) or not lname.startswith(("omx.", "c2."))
             max_w = max_h = 0
             try:
-                vc = info.getCapabilitiesForType(AV1_MIME).getVideoCapabilities()
+                vc = info.getCapabilitiesForType(mime).getVideoCapabilities()
                 max_w = int(vc.getSupportedWidths().getUpper())
                 max_h = int(vc.getSupportedHeights().getUpper())
             except Exception:
@@ -176,7 +182,7 @@ class Diagnostics:
         self.add(f"EXC in {where}: {traceback.format_exc()}", limit=4000)
 
     def schedule(self, reason: str, delay: float):
-        if not self.plugin.get_setting("send_logs", True):
+        if not self.plugin.is_current() or not self.plugin.get_setting("send_logs", True):
             return
         with self.lock:
             if reason not in self.reasons:
@@ -227,11 +233,27 @@ class Diagnostics:
             return False
 
 
-class SupportsDecoderHook(MethodHook):
+class PluginHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
 
+    def before_hooked_method(self, param):
+        if self.plugin.is_current():
+            self.before(param)
+
     def after_hooked_method(self, param):
+        if self.plugin.is_current():
+            self.after(param)
+
+    def before(self, param):
+        pass
+
+    def after(self, param):
+        pass
+
+
+class SupportsDecoderHook(PluginHook):
+    def after(self, param):
         try:
             codec = param.args[0]
             original = bool(param.getResult())
@@ -247,11 +269,8 @@ class SupportsDecoderHook(MethodHook):
             self.plugin.diag.exception("supportsHardwareDecoder")
 
 
-class QualitiesHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class QualitiesHook(PluginHook):
+    def after(self, param):
         try:
             qualities = param.getResult()
             if qualities is None or not self.plugin.can_override():
@@ -265,11 +284,8 @@ class QualitiesHook(MethodHook):
             self.plugin.diag.exception("getQualities")
 
 
-class QualityForPlayerHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class QualityForPlayerHook(PluginHook):
+    def after(self, param):
         try:
             uri = param.getResult()
             if uri is not None:
@@ -283,11 +299,8 @@ class QualityForPlayerHook(MethodHook):
             self.plugin.diag.exception("getQualityForPlayer")
 
 
-class PlayerErrorHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def before_hooked_method(self, param):
+class PlayerErrorHook(PluginHook):
+    def before(self, param):
         try:
             error = param.args[len(param.args) - 1]
             if error is None:
@@ -306,20 +319,17 @@ class PlayerErrorHook(MethodHook):
             self.plugin.diag.exception("onPlayerError")
 
 
-class FirstFrameHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class FirstFrameHook(PluginHook):
+    def after(self, param):
         self.plugin.diag.add("onRenderedFirstFrame")
 
 
-class PlayerEventHook(MethodHook):
+class PlayerEventHook(PluginHook):
     def __init__(self, plugin, name):
         self.plugin = plugin
         self.name = name
 
-    def after_hooked_method(self, param):
+    def after(self, param):
         try:
             args = ", ".join(str(a) for a in param.args)
             self.plugin.diag.add(f"{self.name}({args})")
@@ -376,11 +386,8 @@ def format_support(capabilities) -> str:
     return f"{FORMAT_SUPPORT.get(value & 0b111, value & 0b111)} (raw {value})"
 
 
-class RendererSupportHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class RendererSupportHook(PluginHook):
+    def after(self, param):
         try:
             fmt = next((a for a in param.args if a is not None and str(a).startswith("Format(")), None)
             if fmt is None or param.getResult() is None:
@@ -391,11 +398,8 @@ class RendererSupportHook(MethodHook):
             self.plugin.diag.exception("supportsFormat")
 
 
-class CodecInitializedHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class CodecInitializedHook(PluginHook):
+    def after(self, param):
         try:
             self.plugin.diag.add(f"video codec initialized: {param.args[0]}")
             self.plugin.diag.schedule("codec_initialized", 15)
@@ -403,11 +407,8 @@ class CodecInitializedHook(MethodHook):
             self.plugin.diag.exception("onCodecInitialized")
 
 
-class CodecErrorHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def before_hooked_method(self, param):
+class CodecErrorHook(PluginHook):
+    def before(self, param):
         try:
             self.plugin.diag.add(f"video codec error: {Log.getStackTraceString(param.args[0])}", limit=6000)
             self.plugin.diag.schedule("codec_error", 3)
@@ -415,11 +416,8 @@ class CodecErrorHook(MethodHook):
             self.plugin.diag.exception("onCodecError")
 
 
-class TracksHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class TracksHook(PluginHook):
+    def after(self, param):
         try:
             self.plugin.diag.add(f"onTracksChanged: {describe_tracks(param.args[0])}", limit=6000)
             self.plugin.diag.schedule("tracks", 12)
@@ -427,20 +425,27 @@ class TracksHook(MethodHook):
             self.plugin.diag.exception("onTracksChanged")
 
 
-class DecoderInfosHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
+def decoder_names(infos) -> list:
+    return [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in infos]
 
-    def after_hooked_method(self, param):
+
+class DecoderInfosHook(PluginHook):
+    def after(self, param):
         try:
-            if param.args[0] != AV1_MIME or param.getResult() is None:
+            mime = str(param.args[0])
+            if mime not in (AV1_MIME, HEVC_MIME) or param.getResult() is None:
                 return
             infos = list(jlist(param.getResult()))
-            names = [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in infos]
-            if not self.plugin.override_used or not self.plugin.can_override() or len(infos) < 2:
-                self.plugin.diag.once(f"dec:{names}", f"getDecoderInfos(av01) = {names}")
+            names = decoder_names(infos)
+            if mime == AV1_MIME:
+                active = self.plugin.override_used and self.plugin.can_override()
+                prefer_dav1d = self.plugin.get_setting("prefer_dav1d", True)
+            else:
+                active = self.plugin.force_sw_hevc()
+                prefer_dav1d = False
+            if not active or len(infos) < 2:
+                self.plugin.diag.once(f"dec:{mime}:{names}", f"getDecoderInfos({mime}) = {names}")
                 return
-            prefer_dav1d = self.plugin.get_setting("prefer_dav1d", True)
 
             def rank(info):
                 name = str(info.name).lower()
@@ -449,11 +454,14 @@ class DecoderInfosHook(MethodHook):
                     0 if prefer_dav1d and DAV1D_MARK in name else 1,
                 )
 
+            # Hardware decoders stay at the end so decoder fallback can still reach them.
             ordered = sorted(infos, key=rank)
-            new_names = [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in ordered]
-            self.plugin.diag.once(f"dec:{names}:{new_names}", f"getDecoderInfos(av01) = {names} -> {new_names}")
+            new_names = decoder_names(ordered)
+            self.plugin.diag.once(f"dec:{mime}:{names}:{new_names}", f"getDecoderInfos({mime}) = {names} -> {new_names}")
             if new_names == names:
                 return
+            if mime == HEVC_MIME:
+                self.plugin.diag.schedule("hevc_sw", 20)
             result = ArrayList()
             for info in ordered:
                 result.add(info)
@@ -462,13 +470,10 @@ class DecoderInfosHook(MethodHook):
             self.plugin.diag.exception("getDecoderInfos")
 
 
-class RenderersFactoryHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
+class RenderersFactoryHook(PluginHook):
+    def after(self, param):
         try:
-            if self.plugin.can_override():
+            if self.plugin.can_override() or self.plugin.force_sw_hevc():
                 set_field(param.thisObject, "enableDecoderFallback", True)
         except Exception:
             self.plugin.diag.exception("DefaultRenderersFactory")
@@ -479,8 +484,14 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         self.override_used = False
         self.sw_failed = False
         self.hw_decoders, self.sw_decoders = [], []
+        self.hw_hevc_decoders, self.sw_hevc_decoders = [], []
         self.hook_status = {}
         self.diag = Diagnostics(self)
+        self.token = self.diag.session
+        previous = getattr(sys, OWNER_ATTR, None)
+        setattr(sys, OWNER_ATTR, self.token)
+        if previous:
+            self.diag.add(f"replaced previous plugin instance {previous}")
         try:
             self._install()
         except Exception:
@@ -488,14 +499,23 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         self.diag.schedule("load", 10)
 
     def on_plugin_unload(self):
+        if getattr(sys, OWNER_ATTR, None) == self.token:
+            setattr(sys, OWNER_ATTR, None)
         self.diag.cancel()
 
-    def _install(self):
-        self.hw_decoders, self.sw_decoders = scan_av1_decoders()
-        self.diag.add(f"plugin {__version__} loaded; AV1 decoders: hw={self.hw_decoders} sw={self.sw_decoders}")
+    def is_current(self) -> bool:
+        return getattr(sys, OWNER_ATTR, None) == self.token
 
-        if not self.sw_decoders:
-            self.diag.add("no software AV1 decoder in system, plugin is idle")
+    def _install(self):
+        self.hw_decoders, self.sw_decoders = scan_decoders(AV1_MIME)
+        self.hw_hevc_decoders, self.sw_hevc_decoders = scan_decoders(HEVC_MIME)
+        self.diag.add(
+            f"plugin {__version__} loaded; AV1 decoders: hw={self.hw_decoders} sw={self.sw_decoders}; "
+            f"HEVC decoders: hw={self.hw_hevc_decoders} sw={self.sw_hevc_decoders}"
+        )
+
+        if not self.sw_decoders and not self.sw_hevc_decoders:
+            self.diag.add("no software AV1/HEVC decoder in system, plugin is idle")
             return
 
         video_player = load_class("org.telegram.ui.Components.VideoPlayer")
@@ -565,6 +585,8 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             "abi": Build.SUPPORTED_ABIS[0] if Build.SUPPORTED_ABIS else "",
             "hw_decoders": self.hw_decoders,
             "sw_decoders": self.sw_decoders,
+            "hw_hevc_decoders": self.hw_hevc_decoders,
+            "sw_hevc_decoders": self.sw_hevc_decoders,
             "hooks": self.hook_status,
             "override_used": self.override_used,
             "sw_failed": self.sw_failed,
@@ -573,6 +595,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 "mode": self.mode(),
                 "max_res": self.get_setting("max_res", MAX_RES_DEFAULT),
                 "prefer_dav1d": self.get_setting("prefer_dav1d", True),
+                "force_sw_hevc": self.get_setting("force_sw_hevc", False),
             },
         }
         try:
@@ -587,6 +610,9 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
 
     def can_override(self) -> bool:
         return bool(self.sw_decoders) and not self.sw_failed and self.get_setting("enabled", True)
+
+    def force_sw_hevc(self) -> bool:
+        return bool(self.sw_hevc_decoders) and self.get_setting("force_sw_hevc", False)
 
     def mode(self) -> int:
         return self.get_setting("mode", MODE_FALLBACK)
@@ -603,10 +629,12 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             f"Android API {Build.VERSION.SDK_INT}",
             f"Аппаратные AV1: {fmt(self.hw_decoders)}",
             f"Программные AV1: {fmt(self.sw_decoders)}",
+            f"Аппаратные HEVC: {fmt(self.hw_hevc_decoders)}",
+            f"Программные HEVC: {fmt(self.sw_hevc_decoders)}",
             f"Сессия диагностики: {self.diag.session}",
         ]
         if not self.sw_decoders:
-            lines.append("В системе нет программного AV1-декодера (он есть начиная с Android 10) — плагин ничего не делает.")
+            lines.append("В системе нет программного AV1-декодера (он есть начиная с Android 10) — AV1-часть плагина ничего не делает.")
         elif self.sw_failed:
             lines.append("Программный декодер выдал ошибку и отключён до перезапуска приложения.")
         return "\n".join(lines)
@@ -667,6 +695,14 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 text="Сбросить флаг «AV1 не поддерживается»",
                 icon="msg_reset",
                 on_click=self._reset_unsupported_flag,
+            ),
+            Header(text="HEVC"),
+            Switch(
+                key="force_sw_hevc",
+                text="Программный декодер для HEVC",
+                default=False,
+                subtext="Если HEVC-видео идёт без картинки или с артефактами на аппаратном декодере",
+                icon="msg_video",
             ),
             Header(text="Диагностика"),
             Switch(
