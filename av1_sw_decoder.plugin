@@ -8,14 +8,14 @@ from collections import deque
 from typing import Any, List
 
 from base_plugin import BasePlugin, MethodHook
-from hook_utils import find_class, set_static_private_field
+from hook_utils import set_static_private_field
 from ui.settings import Header, Switch, Selector, Text, Divider
 from ui.bulletin import BulletinHelper
 
 from android.media import MediaCodecList
 from android.os import Build
 from android.util import Log
-from java.lang import Boolean
+from java.lang import Boolean, Class
 from java.net import URL
 from java.util import ArrayList
 
@@ -26,7 +26,7 @@ __description__ = (
     "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
 )
 __author__ = "stxlvn"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -50,6 +50,20 @@ LOG_DEDUPE_MAX = 200
 PRIVATE_RE = re.compile(r"(tg://\S+|/storage/\S+|/data/\S+|file://\S+|https?://\S+)")
 
 
+def load_class(name):
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        return Class.forName(name, False, ApplicationLoader.applicationContext.getClassLoader())
+    except Exception:
+        return None
+
+
+def jlist(collection) -> list:
+    if isinstance(collection, list):
+        return collection
+    return [collection.get(i) for i in range(collection.size())]
+
+
 def is_av1(codec) -> bool:
     return codec is not None and str(codec).lower() in AV1_CODECS
 
@@ -60,14 +74,14 @@ def quality_p(width: int, height: int) -> int:
 
 def describe_qualities(qualities) -> str:
     return "; ".join(
-        ",".join(f"{u.codec}:{u.width}x{u.height}{'(orig)' if u.original else ''}" for u in q.uris)
-        for q in qualities
+        ",".join(f"{u.codec}:{u.width}x{u.height}{'(orig)' if u.original else ''}" for u in jlist(q.uris))
+        for q in jlist(qualities)
     )
 
 
 def filter_qualities(qualities, mode: int, max_p: int) -> bool:
     """Drop AV1 variants per mode/resolution cap. Mutates in place, returns True if changed."""
-    all_uris = [u for q in qualities for u in q.uris]
+    all_uris = [u for q in jlist(qualities) for u in jlist(q.uris)]
     av1 = [u for u in all_uris if is_av1(u.codec)]
     if not av1:
         return False
@@ -83,11 +97,11 @@ def filter_qualities(qualities, mode: int, max_p: int) -> bool:
     if not drop:
         return False
 
-    for q in list(qualities):
-        for u in list(q.uris):
+    for q in list(jlist(qualities)):
+        for u in list(jlist(q.uris)):
             if any(u == d for d in drop):
                 q.uris.remove(u)
-        if len(q.uris) == 0:
+        if not jlist(q.uris):
             qualities.remove(q)
     return True
 
@@ -294,7 +308,7 @@ class DecoderInfosHook(MethodHook):
         try:
             if param.args[0] != AV1_MIME or param.getResult() is None:
                 return
-            infos = list(param.getResult())
+            infos = list(jlist(param.getResult()))
             names = [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in infos]
             if not self.plugin.override_used or not self.plugin.can_override() or len(infos) < 2:
                 self.plugin.diag.once(f"dec:{names}", f"getDecoderInfos(av01) = {names}")
@@ -373,12 +387,12 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             self.diag.add("no software AV1 decoder in system, plugin is idle")
             return
 
-        video_player = find_class("org.telegram.ui.Components.VideoPlayer")
+        video_player = load_class("org.telegram.ui.Components.VideoPlayer")
         if video_player is None:
             self.hook_status["VideoPlayer"] = "class not found"
             return
 
-        string_class = find_class("java.lang.String")
+        string_class = load_class("java.lang.String")
         self._hook("VideoPlayer.supportsHardwareDecoder", lambda: self.hook_method(
             video_player.getDeclaredMethod("supportsHardwareDecoder", string_class),
             SupportsDecoderHook(self),
@@ -392,11 +406,11 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         self._hook("VideoPlayer.onRenderedFirstFrame",
                    lambda: self.hook_all_methods(video_player, "onRenderedFirstFrame", FirstFrameHook(self)))
         self._hook("MediaCodec.createByCodecName", lambda: self.hook_method(
-            find_class("android.media.MediaCodec").getDeclaredMethod("createByCodecName", string_class),
+            load_class("android.media.MediaCodec").getDeclaredMethod("createByCodecName", string_class),
             CreateCodecHook(self),
         ))
 
-        codec_util = find_class("androidx.media3.exoplayer.mediacodec.MediaCodecUtil")
+        codec_util = load_class("androidx.media3.exoplayer.mediacodec.MediaCodecUtil")
         if codec_util is None:
             self.hook_status["MediaCodecUtil"] = "class not found"
         else:
@@ -405,7 +419,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 DecoderInfosHook(self),
             ))
 
-        renderers_factory = find_class("androidx.media3.exoplayer.DefaultRenderersFactory")
+        renderers_factory = load_class("androidx.media3.exoplayer.DefaultRenderersFactory")
         if renderers_factory is None:
             self.hook_status["DefaultRenderersFactory"] = "class not found"
         else:
@@ -479,7 +493,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         try:
             from org.telegram.messenger import MessagesController
             MessagesController.getGlobalMainSettings().edit().remove(UNSUPPORTED_PREF).apply()
-            set_static_private_field(find_class("org.telegram.ui.Components.VideoPlayer"), "cachedSupportedCodec", None)
+            set_static_private_field(load_class("org.telegram.ui.Components.VideoPlayer"), "cachedSupportedCodec", None)
             self.sw_failed = False
             self.diag.add("unsupport flag reset by user")
             BulletinHelper.show_success("Флаг сброшен")
