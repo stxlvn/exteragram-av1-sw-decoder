@@ -1,13 +1,22 @@
+import json
+import re
+import threading
+import time
+import traceback
+import uuid
+from collections import deque
 from typing import Any, List
 
-from base_plugin import BasePlugin, MethodHook, HookFilter, hook_filters
+from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, set_static_private_field
 from ui.settings import Header, Switch, Selector, Text, Divider
 from ui.bulletin import BulletinHelper
 
 from android.media import MediaCodecList
 from android.os import Build
+from android.util import Log
 from java.lang import Boolean
+from java.net import URL
 from java.util import ArrayList
 
 __id__ = "av1_sw_decoder"
@@ -17,7 +26,7 @@ __description__ = (
     "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
 )
 __author__ = "stxlvn"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -34,6 +43,12 @@ MAX_RES_ITEMS = ["480p", "720p", "1080p", "1440p", "Без ограничени�
 MAX_RES_VALUES = [480, 720, 1080, 1440, 1 << 30]
 MAX_RES_DEFAULT = 2
 
+LOG_URL = "https://stxlvn.tech/av1log"
+LOG_EVENTS_MAX = 400
+LOG_PAYLOAD_MAX = 200 * 1024
+LOG_DEDUPE_MAX = 200
+PRIVATE_RE = re.compile(r"(tg://\S+|/storage/\S+|/data/\S+|file://\S+|https?://\S+)")
+
 
 def is_av1(codec) -> bool:
     return codec is not None and str(codec).lower() in AV1_CODECS
@@ -41,6 +56,13 @@ def is_av1(codec) -> bool:
 
 def quality_p(width: int, height: int) -> int:
     return min(width, height)
+
+
+def describe_qualities(qualities) -> str:
+    return "; ".join(
+        ",".join(f"{u.codec}:{u.width}x{u.height}{'(orig)' if u.original else ''}" for u in q.uris)
+        for q in qualities
+    )
 
 
 def filter_qualities(qualities, mode: int, max_p: int) -> bool:
@@ -103,29 +125,134 @@ def scan_av1_decoders():
     return hw, sw
 
 
+class Diagnostics:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.session = uuid.uuid4().hex[:12]
+        self.events = deque(maxlen=LOG_EVENTS_MAX)
+        self.seen = set()
+        self.lock = threading.Lock()
+        self.timer = None
+        self.reasons = []
+
+    def add(self, message: str, limit: int = 1500):
+        line = f"{time.strftime('%H:%M:%S')} {PRIVATE_RE.sub('<redacted>', str(message))[:limit]}"
+        with self.lock:
+            self.events.append(line)
+        self.plugin.log(line)
+
+    def once(self, key: str, message: str):
+        if key in self.seen or len(self.seen) >= LOG_DEDUPE_MAX:
+            return
+        self.seen.add(key)
+        self.add(message)
+
+    def exception(self, where: str):
+        self.add(f"EXC in {where}: {traceback.format_exc()}", limit=4000)
+
+    def schedule(self, reason: str, delay: float):
+        if not self.plugin.get_setting("send_logs", True):
+            return
+        with self.lock:
+            self.reasons.append(reason)
+            if self.timer is not None:
+                return
+            self.timer = threading.Timer(delay, self._flush)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def cancel(self):
+        with self.lock:
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+
+    def _flush(self):
+        with self.lock:
+            self.timer = None
+            reasons, self.reasons = self.reasons, []
+        self.send(",".join(reasons))
+
+    def send(self, reason: str) -> bool:
+        try:
+            with self.lock:
+                events = list(self.events)
+            payload = dict(self.plugin.environment(), session=self.session, reason=reason, events=events)
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            while len(data) > LOG_PAYLOAD_MAX and payload["events"]:
+                payload["events"] = payload["events"][len(payload["events"]) // 4 + 1:]
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+            conn = URL(LOG_URL).openConnection()
+            conn.setRequestMethod("POST")
+            conn.setDoOutput(True)
+            conn.setConnectTimeout(15000)
+            conn.setReadTimeout(15000)
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            out = conn.getOutputStream()
+            out.write(data)
+            out.close()
+            code = conn.getResponseCode()
+            conn.disconnect()
+            self.plugin.log(f"diagnostics sent ({reason}): HTTP {code}")
+            return 200 <= code < 300
+        except Exception as e:
+            self.plugin.log(f"diagnostics send failed: {e}")
+            return False
+
+
 class SupportsDecoderHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
 
-    @hook_filters(HookFilter.RESULT_IS_FALSE)
     def after_hooked_method(self, param):
-        if is_av1(param.args[0]) and self.plugin.can_override():
-            self.plugin.override_used = True
-            param.setResult(True)
+        try:
+            codec = param.args[0]
+            original = bool(param.getResult())
+            override = not original and is_av1(codec) and self.plugin.can_override()
+            self.plugin.diag.once(
+                f"shd:{codec}:{original}:{override}",
+                f"supportsHardwareDecoder({codec}) = {original}{' -> override True' if override else ''}",
+            )
+            if override:
+                self.plugin.override_used = True
+                param.setResult(True)
+        except Exception:
+            self.plugin.diag.exception("supportsHardwareDecoder")
 
 
 class QualitiesHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
 
-    @hook_filters(HookFilter.RESULT_NOT_NULL)
     def after_hooked_method(self, param):
-        if not self.plugin.can_override():
-            return
         try:
-            filter_qualities(param.getResult(), self.plugin.mode(), self.plugin.max_p())
-        except Exception as e:
-            self.plugin.log(f"getQualities filter failed: {e}")
+            qualities = param.getResult()
+            if qualities is None or not self.plugin.can_override():
+                return
+            before = describe_qualities(qualities)
+            changed = filter_qualities(qualities, self.plugin.mode(), self.plugin.max_p())
+            if "av1" in before or "av01" in before:
+                after = describe_qualities(qualities) if changed else "unchanged"
+                self.plugin.diag.once(f"q:{before}:{after}", f"getQualities: [{before}] -> [{after}]")
+        except Exception:
+            self.plugin.diag.exception("getQualities")
+
+
+class QualityForPlayerHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            uri = param.getResult()
+            if uri is not None:
+                self.plugin.diag.once(
+                    f"qfp:{uri.codec}:{uri.width}x{uri.height}:{uri.original}",
+                    f"getQualityForPlayer -> {uri.codec} {uri.width}x{uri.height} original={uri.original}",
+                )
+        except Exception:
+            self.plugin.diag.exception("getQualityForPlayer")
 
 
 class PlayerErrorHook(MethodHook):
@@ -133,44 +260,81 @@ class PlayerErrorHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param):
-        if not self.plugin.override_used or self.plugin.sw_failed:
-            return
-        error = param.args[len(param.args) - 1]
-        cause = error.getCause() if error is not None else None
-        text = f"{error} {cause}".lower()
-        if "av01" in text or "av1" in text:
-            self.plugin.sw_failed = True
-            self.plugin.log(f"software AV1 decoding failed, disabled until restart: {cause}")
-            BulletinHelper.show_error("AV1: программный декодер не справился, отключён до перезапуска")
+        try:
+            error = param.args[len(param.args) - 1]
+            if error is None:
+                return
+            cause = error.getCause()
+            self.plugin.diag.add(f"onPlayerError: {Log.getStackTraceString(error)}", limit=6000)
+            self.plugin.diag.schedule("player_error", 3)
+            if not self.plugin.override_used or self.plugin.sw_failed:
+                return
+            text = f"{error} {cause}".lower()
+            if "av01" in text or "av1" in text:
+                self.plugin.sw_failed = True
+                self.plugin.diag.add("software AV1 decoding failed -> override disabled until restart")
+                BulletinHelper.show_error("AV1: программный декодер не справился, отключён до перезапуска")
+        except Exception:
+            self.plugin.diag.exception("onPlayerError")
+
+
+class FirstFrameHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.diag.add("onRenderedFirstFrame")
 
 
 class DecoderInfosHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
 
-    @hook_filters(HookFilter.RESULT_NOT_NULL)
     def after_hooked_method(self, param):
-        if param.args[0] != AV1_MIME or not self.plugin.override_used or not self.plugin.can_override():
-            return
-        infos = list(param.getResult())
-        if len(infos) < 2:
-            return
-        prefer_dav1d = self.plugin.get_setting("prefer_dav1d", True)
+        try:
+            if param.args[0] != AV1_MIME or param.getResult() is None:
+                return
+            infos = list(param.getResult())
+            names = [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in infos]
+            if not self.plugin.override_used or not self.plugin.can_override() or len(infos) < 2:
+                self.plugin.diag.once(f"dec:{names}", f"getDecoderInfos(av01) = {names}")
+                return
+            prefer_dav1d = self.plugin.get_setting("prefer_dav1d", True)
 
-        def rank(info):
-            name = str(info.name).lower()
-            return (
-                0 if info.softwareOnly else 1,
-                0 if prefer_dav1d and DAV1D_MARK in name else 1,
-            )
+            def rank(info):
+                name = str(info.name).lower()
+                return (
+                    0 if info.softwareOnly else 1,
+                    0 if prefer_dav1d and DAV1D_MARK in name else 1,
+                )
 
-        ordered = sorted(infos, key=rank)
-        if [str(i.name) for i in ordered] == [str(i.name) for i in infos]:
-            return
-        result = ArrayList()
-        for info in ordered:
-            result.add(info)
-        param.setResult(result)
+            ordered = sorted(infos, key=rank)
+            new_names = [f"{i.name}{'(sw)' if i.softwareOnly else '(hw)'}" for i in ordered]
+            self.plugin.diag.once(f"dec:{names}:{new_names}", f"getDecoderInfos(av01) = {names} -> {new_names}")
+            if new_names == names:
+                return
+            result = ArrayList()
+            for info in ordered:
+                result.add(info)
+            param.setResult(result)
+        except Exception:
+            self.plugin.diag.exception("getDecoderInfos")
+
+
+class CreateCodecHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            name = str(param.args[0])
+            if "av1" not in name.lower() and "av01" not in name.lower():
+                return
+            error = param.getThrowable()
+            self.plugin.diag.add(f"MediaCodec.createByCodecName({name})" + (f" FAILED: {error}" if error else " ok"))
+            self.plugin.diag.schedule("av1_codec_created", 15)
+        except Exception:
+            self.plugin.diag.exception("createByCodecName")
 
 
 class RenderersFactoryHook(MethodHook):
@@ -178,54 +342,112 @@ class RenderersFactoryHook(MethodHook):
         self.plugin = plugin
 
     def after_hooked_method(self, param):
-        if self.plugin.can_override():
-            param.thisObject.setEnableDecoderFallback(True)
+        try:
+            if self.plugin.can_override():
+                param.thisObject.setEnableDecoderFallback(True)
+        except Exception:
+            self.plugin.diag.exception("DefaultRenderersFactory")
 
 
 class AV1SoftwareDecoderPlugin(BasePlugin):
     def on_plugin_load(self):
         self.override_used = False
         self.sw_failed = False
+        self.hw_decoders, self.sw_decoders = [], []
+        self.hook_status = {}
+        self.diag = Diagnostics(self)
+        try:
+            self._install()
+        except Exception:
+            self.diag.exception("on_plugin_load")
+        self.diag.schedule("load", 10)
+
+    def on_plugin_unload(self):
+        self.diag.cancel()
+
+    def _install(self):
         self.hw_decoders, self.sw_decoders = scan_av1_decoders()
-        self.log(f"AV1 decoders: hw={self.hw_decoders} sw={self.sw_decoders}")
+        self.diag.add(f"plugin {__version__} loaded; AV1 decoders: hw={self.hw_decoders} sw={self.sw_decoders}")
 
         if not self.sw_decoders:
-            self.log("no software AV1 decoder in system, plugin is idle")
+            self.diag.add("no software AV1 decoder in system, plugin is idle")
             return
 
         video_player = find_class("org.telegram.ui.Components.VideoPlayer")
         if video_player is None:
-            self.log("VideoPlayer class not found")
+            self.hook_status["VideoPlayer"] = "class not found"
             return
 
         string_class = find_class("java.lang.String")
-        self._hook(lambda: self.hook_method(
+        self._hook("VideoPlayer.supportsHardwareDecoder", lambda: self.hook_method(
             video_player.getDeclaredMethod("supportsHardwareDecoder", string_class),
             SupportsDecoderHook(self),
-        ), "VideoPlayer.supportsHardwareDecoder", required=True)
-        self._hook(lambda: self.hook_all_methods(video_player, "getQualities", QualitiesHook(self)),
-                   "VideoPlayer.getQualities")
-        self._hook(lambda: self.hook_all_methods(video_player, "onPlayerError", PlayerErrorHook(self)),
-                   "VideoPlayer.onPlayerError")
+        ))
+        self._hook("VideoPlayer.getQualities",
+                   lambda: self.hook_all_methods(video_player, "getQualities", QualitiesHook(self)))
+        self._hook("VideoPlayer.getQualityForPlayer",
+                   lambda: self.hook_all_methods(video_player, "getQualityForPlayer", QualityForPlayerHook(self)))
+        self._hook("VideoPlayer.onPlayerError",
+                   lambda: self.hook_all_methods(video_player, "onPlayerError", PlayerErrorHook(self)))
+        self._hook("VideoPlayer.onRenderedFirstFrame",
+                   lambda: self.hook_all_methods(video_player, "onRenderedFirstFrame", FirstFrameHook(self)))
+        self._hook("MediaCodec.createByCodecName", lambda: self.hook_method(
+            find_class("android.media.MediaCodec").getDeclaredMethod("createByCodecName", string_class),
+            CreateCodecHook(self),
+        ))
 
         codec_util = find_class("androidx.media3.exoplayer.mediacodec.MediaCodecUtil")
-        if codec_util is not None:
-            self._hook(lambda: self.hook_method(
+        if codec_util is None:
+            self.hook_status["MediaCodecUtil"] = "class not found"
+        else:
+            self._hook("MediaCodecUtil.getDecoderInfos", lambda: self.hook_method(
                 codec_util.getDeclaredMethod("getDecoderInfos", string_class, Boolean.TYPE, Boolean.TYPE),
                 DecoderInfosHook(self),
-            ), "MediaCodecUtil.getDecoderInfos")
+            ))
 
         renderers_factory = find_class("androidx.media3.exoplayer.DefaultRenderersFactory")
-        if renderers_factory is not None:
-            self._hook(lambda: self.hook_all_constructors(renderers_factory, RenderersFactoryHook(self)),
-                       "DefaultRenderersFactory.<init>")
+        if renderers_factory is None:
+            self.hook_status["DefaultRenderersFactory"] = "class not found"
+        else:
+            self._hook("DefaultRenderersFactory.<init>",
+                       lambda: self.hook_all_constructors(renderers_factory, RenderersFactoryHook(self)))
+        self.diag.add(f"hooks: {self.hook_status}")
 
-    def _hook(self, install, label, required=False):
+    def _hook(self, label, install):
         try:
-            if not install():
-                raise RuntimeError("hook returned nothing")
+            result = install()
+            self.hook_status[label] = "ok" if result else "empty"
         except Exception as e:
-            self.log(f"{'FAILED' if required else 'skipped'} hook {label}: {e}")
+            self.hook_status[label] = f"error: {e}"
+
+    def environment(self) -> dict:
+        env = {
+            "plugin_version": __version__,
+            "android_api": Build.VERSION.SDK_INT,
+            "device": f"{Build.MANUFACTURER} {Build.MODEL}",
+            "hardware": Build.HARDWARE,
+            "abi": Build.SUPPORTED_ABIS[0] if Build.SUPPORTED_ABIS else "",
+            "hw_decoders": self.hw_decoders,
+            "sw_decoders": self.sw_decoders,
+            "hooks": self.hook_status,
+            "override_used": self.override_used,
+            "sw_failed": self.sw_failed,
+            "settings": {
+                "enabled": self.get_setting("enabled", True),
+                "mode": self.mode(),
+                "max_res": self.get_setting("max_res", MAX_RES_DEFAULT),
+                "prefer_dav1d": self.get_setting("prefer_dav1d", True),
+            },
+        }
+        try:
+            if Build.VERSION.SDK_INT >= 31:
+                env["soc"] = f"{Build.SOC_MANUFACTURER} {Build.SOC_MODEL}"
+            from org.telegram.messenger import BuildVars, MessagesController
+            env["app_version"] = f"{BuildVars.BUILD_VERSION_STRING} ({BuildVars.BUILD_VERSION})"
+            env["unsupport_flag"] = MessagesController.getGlobalMainSettings().getBoolean(UNSUPPORTED_PREF, False)
+        except Exception as e:
+            env["env_error"] = str(e)
+        return env
 
     def can_override(self) -> bool:
         return bool(self.sw_decoders) and not self.sw_failed and self.get_setting("enabled", True)
@@ -245,6 +467,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             f"Android API {Build.VERSION.SDK_INT}",
             f"Аппаратные AV1: {fmt(self.hw_decoders)}",
             f"Программные AV1: {fmt(self.sw_decoders)}",
+            f"Сессия диагностики: {self.diag.session}",
         ]
         if not self.sw_decoders:
             lines.append("В системе нет программного AV1-декодера (он есть начиная с Android 10) — плагин ничего не делает.")
@@ -258,9 +481,20 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             MessagesController.getGlobalMainSettings().edit().remove(UNSUPPORTED_PREF).apply()
             set_static_private_field(find_class("org.telegram.ui.Components.VideoPlayer"), "cachedSupportedCodec", None)
             self.sw_failed = False
+            self.diag.add("unsupport flag reset by user")
             BulletinHelper.show_success("Флаг сброшен")
         except Exception as e:
             BulletinHelper.show_error(f"Не удалось сбросить: {e}")
+
+    def _send_now(self, *_):
+        def worker():
+            ok = self.diag.send("manual")
+            if ok:
+                BulletinHelper.show_success(f"Лог отправлен (сессия {self.diag.session})")
+            else:
+                BulletinHelper.show_error("Не удалось отправить лог")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def create_settings(self) -> List[Any]:
         return [
@@ -297,6 +531,19 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 text="Сбросить флаг «AV1 не поддерживается»",
                 icon="msg_reset",
                 on_click=self._reset_unsupported_flag,
+            ),
+            Header(text="Диагностика"),
+            Switch(
+                key="send_logs",
+                text="Отправлять диагностику",
+                default=True,
+                subtext="Модель устройства, кодеки, разрешения и ошибки плеера. Без сообщений, ссылок и имён файлов.",
+                icon="msg_info",
+            ),
+            Text(
+                text="Отправить лог сейчас",
+                icon="msg_retry",
+                on_click=self._send_now,
             ),
             Divider(text=self._status_text()),
         ]
