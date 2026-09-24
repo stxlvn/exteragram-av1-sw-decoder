@@ -26,7 +26,7 @@ __description__ = (
     "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
 )
 __author__ = "stxlvn"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -265,6 +265,8 @@ class QualityForPlayerHook(MethodHook):
                     f"qfp:{uri.codec}:{uri.width}x{uri.height}:{uri.original}",
                     f"getQualityForPlayer -> {uri.codec} {uri.width}x{uri.height} original={uri.original}",
                 )
+                if is_av1(uri.codec):
+                    self.plugin.diag.schedule("av1_selected", 20)
         except Exception:
             self.plugin.diag.exception("getQualityForPlayer")
 
@@ -298,6 +300,63 @@ class FirstFrameHook(MethodHook):
 
     def after_hooked_method(self, param):
         self.plugin.diag.add("onRenderedFirstFrame")
+
+
+class PlayerEventHook(MethodHook):
+    def __init__(self, plugin, name):
+        self.plugin = plugin
+        self.name = name
+
+    def after_hooked_method(self, param):
+        try:
+            args = ", ".join(str(a) for a in param.args)
+            self.plugin.diag.add(f"{self.name}({args})")
+        except Exception:
+            self.plugin.diag.exception(self.name)
+
+
+def describe_tracks(tracks) -> str:
+    try:
+        groups = tracks.getGroups()
+        parts = []
+        for g in jlist(groups):
+            for i in range(g.length):
+                parts.append(
+                    f"type={g.getType()} {g.getTrackFormat(i)} support={g.getTrackSupport(i)} selected={g.isTrackSelected(i)}"
+                )
+        return " | ".join(parts) or "no tracks"
+    except Exception as e:
+        return f"api failed ({e}); fields: {dump_fields(tracks)}"
+
+
+def dump_fields(obj, depth: int = 2) -> str:
+    if obj is None or depth < 0:
+        return str(obj)
+    try:
+        cls = obj.getClass()
+        out = []
+        for f in cls.getDeclaredFields():
+            f.setAccessible(True)
+            value = f.get(obj)
+            text = str(value)
+            if value is not None and "@" in text and depth > 0:
+                text = dump_fields(value, depth - 1)
+            out.append(f"{f.getName()}={text[:600]}")
+        return f"{cls.getName()}{{{', '.join(out)}}}"
+    except Exception as e:
+        return f"{obj} (dump failed: {e})"
+
+
+class TracksHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.diag.add(f"onTracksChanged: {describe_tracks(param.args[0])}", limit=6000)
+            self.plugin.diag.schedule("tracks", 12)
+        except Exception:
+            self.plugin.diag.exception("onTracksChanged")
 
 
 class DecoderInfosHook(MethodHook):
@@ -405,6 +464,11 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                    lambda: self.hook_all_methods(video_player, "onPlayerError", PlayerErrorHook(self)))
         self._hook("VideoPlayer.onRenderedFirstFrame",
                    lambda: self.hook_all_methods(video_player, "onRenderedFirstFrame", FirstFrameHook(self)))
+        self._hook("VideoPlayer.onTracksChanged",
+                   lambda: self.hook_all_methods(video_player, "onTracksChanged", TracksHook(self)))
+        for event in ("onPlayerStateChanged", "onVideoSizeChanged", "preparePlayer"):
+            self._hook(f"VideoPlayer.{event}",
+                       lambda event=event: self.hook_all_methods(video_player, event, PlayerEventHook(self, event)))
         self._hook("MediaCodec.createByCodecName", lambda: self.hook_method(
             load_class("android.media.MediaCodec").getDeclaredMethod("createByCodecName", string_class),
             CreateCodecHook(self),
@@ -430,7 +494,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
     def _hook(self, label, install):
         try:
             result = install()
-            self.hook_status[label] = "ok" if result else "empty"
+            self.hook_status[label] = f"ok ({len(result)})" if isinstance(result, list) else ("ok" if result is not None else "none")
         except Exception as e:
             self.hook_status[label] = f"error: {e}"
 
