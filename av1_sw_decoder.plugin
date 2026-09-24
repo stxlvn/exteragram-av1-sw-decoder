@@ -26,7 +26,7 @@ __description__ = (
     "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
 )
 __author__ = "stxlvn"
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -56,6 +56,17 @@ def load_class(name):
         return Class.forName(name, False, ApplicationLoader.applicationContext.getClassLoader())
     except Exception:
         return None
+
+
+EXOPLAYER_PACKAGES = ("com.google.android.exoplayer2", "androidx.media3.exoplayer")
+
+
+def load_any_class(suffix):
+    for package in EXOPLAYER_PACKAGES:
+        cls = load_class(f"{package}.{suffix}")
+        if cls is not None:
+            return cls
+    return None
 
 
 def jlist(collection) -> list:
@@ -315,36 +326,79 @@ class PlayerEventHook(MethodHook):
             self.plugin.diag.exception(self.name)
 
 
+FORMAT_SUPPORT = {4: "HANDLED", 3: "EXCEEDS_CAPABILITIES", 2: "UNSUPPORTED_DRM", 1: "UNSUPPORTED_SUBTYPE", 0: "UNSUPPORTED_TYPE"}
+
+
+def get_field(obj, name):
+    cls = obj.getClass()
+    while cls is not None:
+        try:
+            field = cls.getDeclaredField(name)
+            field.setAccessible(True)
+            return field.get(obj)
+        except Exception:
+            cls = cls.getSuperclass()
+    raise AttributeError(name)
+
+
 def describe_tracks(tracks) -> str:
     try:
-        groups = tracks.getGroups()
         parts = []
-        for g in jlist(groups):
-            for i in range(g.length):
+        for group in jlist(get_field(tracks, "groups")):
+            formats = get_field(get_field(group, "mediaTrackGroup"), "formats")
+            support = get_field(group, "trackSupport")
+            selected = get_field(group, "trackSelected")
+            for i in range(len(formats)):
                 parts.append(
-                    f"type={g.getType()} {g.getTrackFormat(i)} support={g.getTrackSupport(i)} selected={g.isTrackSelected(i)}"
+                    f"{formats[i]} support={FORMAT_SUPPORT.get(support[i], support[i])} selected={selected[i]}"
                 )
         return " | ".join(parts) or "no tracks"
     except Exception as e:
-        return f"api failed ({e}); fields: {dump_fields(tracks)}"
+        return f"reflection failed: {e}"
 
 
-def dump_fields(obj, depth: int = 2) -> str:
-    if obj is None or depth < 0:
-        return str(obj)
-    try:
-        cls = obj.getClass()
-        out = []
-        for f in cls.getDeclaredFields():
-            f.setAccessible(True)
-            value = f.get(obj)
-            text = str(value)
-            if value is not None and "@" in text and depth > 0:
-                text = dump_fields(value, depth - 1)
-            out.append(f"{f.getName()}={text[:600]}")
-        return f"{cls.getName()}{{{', '.join(out)}}}"
-    except Exception as e:
-        return f"{obj} (dump failed: {e})"
+def format_support(capabilities) -> str:
+    value = int(capabilities)
+    return f"{FORMAT_SUPPORT.get(value & 0b111, value & 0b111)} (raw {value})"
+
+
+class RendererSupportHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            fmt = next((a for a in param.args if a is not None and str(a).startswith("Format(")), None)
+            if fmt is None or param.getResult() is None:
+                return
+            text = f"{fmt} -> {format_support(param.getResult())}"
+            self.plugin.diag.once(f"sf:{text}", f"VideoRenderer.supportsFormat: {text}")
+        except Exception:
+            self.plugin.diag.exception("supportsFormat")
+
+
+class CodecInitializedHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.diag.add(f"video codec initialized: {param.args[0]}")
+            self.plugin.diag.schedule("codec_initialized", 15)
+        except Exception:
+            self.plugin.diag.exception("onCodecInitialized")
+
+
+class CodecErrorHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.diag.add(f"video codec error: {Log.getStackTraceString(param.args[0])}", limit=6000)
+            self.plugin.diag.schedule("codec_error", 3)
+        except Exception:
+            self.plugin.diag.exception("onCodecError")
 
 
 class TracksHook(MethodHook):
@@ -392,22 +446,6 @@ class DecoderInfosHook(MethodHook):
             param.setResult(result)
         except Exception:
             self.plugin.diag.exception("getDecoderInfos")
-
-
-class CreateCodecHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            name = str(param.args[0])
-            if "av1" not in name.lower() and "av01" not in name.lower():
-                return
-            error = param.getThrowable()
-            self.plugin.diag.add(f"MediaCodec.createByCodecName({name})" + (f" FAILED: {error}" if error else " ok"))
-            self.plugin.diag.schedule("av1_codec_created", 15)
-        except Exception:
-            self.plugin.diag.exception("createByCodecName")
 
 
 class RenderersFactoryHook(MethodHook):
@@ -469,12 +507,18 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         for event in ("onPlayerStateChanged", "onVideoSizeChanged", "preparePlayer"):
             self._hook(f"VideoPlayer.{event}",
                        lambda event=event: self.hook_all_methods(video_player, event, PlayerEventHook(self, event)))
-        self._hook("MediaCodec.createByCodecName", lambda: self.hook_method(
-            load_class("android.media.MediaCodec").getDeclaredMethod("createByCodecName", string_class),
-            CreateCodecHook(self),
-        ))
+        video_renderer = load_any_class("video.MediaCodecVideoRenderer")
+        if video_renderer is None:
+            self.hook_status["MediaCodecVideoRenderer"] = "class not found"
+        else:
+            self._hook("MediaCodecVideoRenderer.supportsFormat",
+                       lambda: self.hook_all_methods(video_renderer, "supportsFormat", RendererSupportHook(self)))
+            self._hook("MediaCodecVideoRenderer.onCodecInitialized",
+                       lambda: self.hook_all_methods(video_renderer, "onCodecInitialized", CodecInitializedHook(self)))
+            self._hook("MediaCodecVideoRenderer.onCodecError",
+                       lambda: self.hook_all_methods(video_renderer, "onCodecError", CodecErrorHook(self)))
 
-        codec_util = load_class("androidx.media3.exoplayer.mediacodec.MediaCodecUtil")
+        codec_util = load_any_class("mediacodec.MediaCodecUtil")
         if codec_util is None:
             self.hook_status["MediaCodecUtil"] = "class not found"
         else:
@@ -483,7 +527,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 DecoderInfosHook(self),
             ))
 
-        renderers_factory = load_class("androidx.media3.exoplayer.DefaultRenderersFactory")
+        renderers_factory = load_any_class("DefaultRenderersFactory")
         if renderers_factory is None:
             self.hook_status["DefaultRenderersFactory"] = "class not found"
         else:
