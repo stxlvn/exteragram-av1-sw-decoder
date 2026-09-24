@@ -1,0 +1,302 @@
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodHook, HookFilter, hook_filters
+from hook_utils import find_class, set_static_private_field
+from ui.settings import Header, Switch, Selector, Text, Divider
+from ui.bulletin import BulletinHelper
+
+from android.media import MediaCodecList
+from android.os import Build
+from java.lang import Boolean
+from java.util import ArrayList
+
+__id__ = "av1_sw_decoder"
+__name__ = "AV1 Software Decoder"
+__description__ = (
+    "Позволяет воспроизводить AV1-видео программным декодером "
+    "(c2.android.av1-dav1d / libgav1) на устройствах без аппаратной поддержки AV1."
+)
+__author__ = "stxlvn"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+AV1_CODECS = ("av1", "av01")
+AV1_MIME = "video/av01"
+UNSUPPORTED_PREF = "unsupport_" + AV1_MIME
+DAV1D_MARK = "dav1d"
+
+MODE_FALLBACK = 0
+MODE_ALWAYS = 1
+
+MAX_RES_ITEMS = ["480p", "720p", "1080p", "1440p", "Без ограничений"]
+MAX_RES_VALUES = [480, 720, 1080, 1440, 1 << 30]
+MAX_RES_DEFAULT = 2
+
+
+def is_av1(codec) -> bool:
+    return codec is not None and str(codec).lower() in AV1_CODECS
+
+
+def quality_p(width: int, height: int) -> int:
+    return min(width, height)
+
+
+def filter_qualities(qualities, mode: int, max_p: int) -> bool:
+    """Drop AV1 variants per mode/resolution cap. Mutates in place, returns True if changed."""
+    all_uris = [u for q in qualities for u in q.uris]
+    av1 = [u for u in all_uris if is_av1(u.codec)]
+    if not av1:
+        return False
+
+    has_other = len(av1) != len(all_uris)
+    if mode == MODE_FALLBACK and has_other:
+        drop = av1
+    else:
+        drop = [u for u in av1 if quality_p(u.width, u.height) > max_p]
+        if len(drop) == len(all_uris):
+            smallest = min(drop, key=lambda u: u.width * u.height)
+            drop = [u for u in drop if u != smallest]
+    if not drop:
+        return False
+
+    for q in list(qualities):
+        for u in list(q.uris):
+            if any(u == d for d in drop):
+                q.uris.remove(u)
+        if len(q.uris) == 0:
+            qualities.remove(q)
+    return True
+
+
+def scan_av1_decoders():
+    hw, sw = [], []
+    try:
+        infos = MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()
+    except Exception:
+        return hw, sw
+    sdk = Build.VERSION.SDK_INT
+    for info in infos:
+        try:
+            if info.isEncoder():
+                continue
+            if not any(t.lower() == AV1_MIME for t in info.getSupportedTypes()):
+                continue
+            name = info.getName()
+            if sdk >= 29:
+                software = info.isSoftwareOnly() or not info.isHardwareAccelerated()
+            else:
+                lname = name.lower()
+                software = lname.startswith(("omx.google.", "c2.android.", "c2.google.")) or not lname.startswith(("omx.", "c2."))
+            max_w = max_h = 0
+            try:
+                vc = info.getCapabilitiesForType(AV1_MIME).getVideoCapabilities()
+                max_w = int(vc.getSupportedWidths().getUpper())
+                max_h = int(vc.getSupportedHeights().getUpper())
+            except Exception:
+                pass
+            (sw if software else hw).append((name, max_w, max_h))
+        except Exception:
+            continue
+    sw.sort(key=lambda d: 0 if DAV1D_MARK in d[0].lower() else 1)
+    return hw, sw
+
+
+class SupportsDecoderHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    @hook_filters(HookFilter.RESULT_IS_FALSE)
+    def after_hooked_method(self, param):
+        if is_av1(param.args[0]) and self.plugin.can_override():
+            self.plugin.override_used = True
+            param.setResult(True)
+
+
+class QualitiesHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    @hook_filters(HookFilter.RESULT_NOT_NULL)
+    def after_hooked_method(self, param):
+        if not self.plugin.can_override():
+            return
+        try:
+            filter_qualities(param.getResult(), self.plugin.mode(), self.plugin.max_p())
+        except Exception as e:
+            self.plugin.log(f"getQualities filter failed: {e}")
+
+
+class PlayerErrorHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.override_used or self.plugin.sw_failed:
+            return
+        error = param.args[len(param.args) - 1]
+        cause = error.getCause() if error is not None else None
+        text = f"{error} {cause}".lower()
+        if "av01" in text or "av1" in text:
+            self.plugin.sw_failed = True
+            self.plugin.log(f"software AV1 decoding failed, disabled until restart: {cause}")
+            BulletinHelper.show_error("AV1: программный декодер не справился, отключён до перезапуска")
+
+
+class DecoderInfosHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    @hook_filters(HookFilter.RESULT_NOT_NULL)
+    def after_hooked_method(self, param):
+        if param.args[0] != AV1_MIME or not self.plugin.override_used or not self.plugin.can_override():
+            return
+        infos = list(param.getResult())
+        if len(infos) < 2:
+            return
+        prefer_dav1d = self.plugin.get_setting("prefer_dav1d", True)
+
+        def rank(info):
+            name = str(info.name).lower()
+            return (
+                0 if info.softwareOnly else 1,
+                0 if prefer_dav1d and DAV1D_MARK in name else 1,
+            )
+
+        ordered = sorted(infos, key=rank)
+        if [str(i.name) for i in ordered] == [str(i.name) for i in infos]:
+            return
+        result = ArrayList()
+        for info in ordered:
+            result.add(info)
+        param.setResult(result)
+
+
+class RenderersFactoryHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin.can_override():
+            param.thisObject.setEnableDecoderFallback(True)
+
+
+class AV1SoftwareDecoderPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.override_used = False
+        self.sw_failed = False
+        self.hw_decoders, self.sw_decoders = scan_av1_decoders()
+        self.log(f"AV1 decoders: hw={self.hw_decoders} sw={self.sw_decoders}")
+
+        if not self.sw_decoders:
+            self.log("no software AV1 decoder in system, plugin is idle")
+            return
+
+        video_player = find_class("org.telegram.ui.Components.VideoPlayer")
+        if video_player is None:
+            self.log("VideoPlayer class not found")
+            return
+
+        string_class = find_class("java.lang.String")
+        self._hook(lambda: self.hook_method(
+            video_player.getDeclaredMethod("supportsHardwareDecoder", string_class),
+            SupportsDecoderHook(self),
+        ), "VideoPlayer.supportsHardwareDecoder", required=True)
+        self._hook(lambda: self.hook_all_methods(video_player, "getQualities", QualitiesHook(self)),
+                   "VideoPlayer.getQualities")
+        self._hook(lambda: self.hook_all_methods(video_player, "onPlayerError", PlayerErrorHook(self)),
+                   "VideoPlayer.onPlayerError")
+
+        codec_util = find_class("androidx.media3.exoplayer.mediacodec.MediaCodecUtil")
+        if codec_util is not None:
+            self._hook(lambda: self.hook_method(
+                codec_util.getDeclaredMethod("getDecoderInfos", string_class, Boolean.TYPE, Boolean.TYPE),
+                DecoderInfosHook(self),
+            ), "MediaCodecUtil.getDecoderInfos")
+
+        renderers_factory = find_class("androidx.media3.exoplayer.DefaultRenderersFactory")
+        if renderers_factory is not None:
+            self._hook(lambda: self.hook_all_constructors(renderers_factory, RenderersFactoryHook(self)),
+                       "DefaultRenderersFactory.<init>")
+
+    def _hook(self, install, label, required=False):
+        try:
+            if not install():
+                raise RuntimeError("hook returned nothing")
+        except Exception as e:
+            self.log(f"{'FAILED' if required else 'skipped'} hook {label}: {e}")
+
+    def can_override(self) -> bool:
+        return bool(self.sw_decoders) and not self.sw_failed and self.get_setting("enabled", True)
+
+    def mode(self) -> int:
+        return self.get_setting("mode", MODE_FALLBACK)
+
+    def max_p(self) -> int:
+        index = self.get_setting("max_res", MAX_RES_DEFAULT)
+        return MAX_RES_VALUES[index] if 0 <= index < len(MAX_RES_VALUES) else MAX_RES_VALUES[MAX_RES_DEFAULT]
+
+    def _status_text(self) -> str:
+        def fmt(decoders):
+            return ", ".join(f"{n} (до {w}×{h})" if w and h else n for n, w, h in decoders) or "нет"
+
+        lines = [
+            f"Android API {Build.VERSION.SDK_INT}",
+            f"Аппаратные AV1: {fmt(self.hw_decoders)}",
+            f"Программные AV1: {fmt(self.sw_decoders)}",
+        ]
+        if not self.sw_decoders:
+            lines.append("В системе нет программного AV1-декодера (он есть начиная с Android 10) — плагин ничего не делает.")
+        elif self.sw_failed:
+            lines.append("Программный декодер выдал ошибку и отключён до перезапуска приложения.")
+        return "\n".join(lines)
+
+    def _reset_unsupported_flag(self, *_):
+        try:
+            from org.telegram.messenger import MessagesController
+            MessagesController.getGlobalMainSettings().edit().remove(UNSUPPORTED_PREF).apply()
+            set_static_private_field(find_class("org.telegram.ui.Components.VideoPlayer"), "cachedSupportedCodec", None)
+            self.sw_failed = False
+            BulletinHelper.show_success("Флаг сброшен")
+        except Exception as e:
+            BulletinHelper.show_error(f"Не удалось сбросить: {e}")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="AV1"),
+            Switch(
+                key="enabled",
+                text="Программный декодер AV1",
+                default=True,
+                subtext="Работает только если аппаратного AV1 нет",
+                icon="msg_video",
+            ),
+            Selector(
+                key="mode",
+                text="Когда использовать AV1",
+                default=MODE_FALLBACK,
+                items=["Только если нет другого кодека", "Всегда, когда есть AV1"],
+                icon="msg_settings",
+            ),
+            Selector(
+                key="max_res",
+                text="Макс. разрешение AV1",
+                default=MAX_RES_DEFAULT,
+                items=MAX_RES_ITEMS,
+                icon="msg_photo_settings",
+            ),
+            Switch(
+                key="prefer_dav1d",
+                text="Предпочитать dav1d",
+                default=True,
+                subtext="c2.android.av1-dav1d.decoder обычно быстрее libgav1",
+                icon="msg_speed",
+            ),
+            Text(
+                text="Сбросить флаг «AV1 не поддерживается»",
+                icon="msg_reset",
+                on_click=self._reset_unsupported_flag,
+            ),
+            Divider(text=self._status_text()),
+        ]
