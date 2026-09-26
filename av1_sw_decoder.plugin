@@ -1,3 +1,5 @@
+import importlib
+import inspect
 import json
 import re
 import sys
@@ -28,7 +30,7 @@ __description__ = (
     "Может также включать программный декодер для HEVC."
 )
 __author__ = "stxlvn"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -53,6 +55,11 @@ LOG_DEDUPE_MAX = 200
 # Attribute on the shared `sys` module naming the live plugin instance: hooks left behind by
 # older instances (the app does not remove them on reinstall) see they are stale and do nothing.
 OWNER_ATTR = "_av1_sw_decoder_owner"
+SDK_MODULES = (
+    "base_plugin", "hook_utils", "android_utils", "client_utils", "file_utils",
+    "markdown_utils", "ui.settings", "ui.bulletin", "ui.alert", "extera_utils.classes",
+)
+SDK_SOURCE_MAX = 180 * 1024
 PRIVATE_RE = re.compile(r"(tg://\S+|/storage/\S+|/data/\S+|file://\S+|https?://\S+)")
 
 
@@ -214,23 +221,82 @@ class Diagnostics:
             while len(data) > LOG_PAYLOAD_MAX and payload["events"]:
                 payload["events"] = payload["events"][len(payload["events"]) // 4 + 1:]
                 data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-            conn = URL(LOG_URL).openConnection()
-            conn.setRequestMethod("POST")
-            conn.setDoOutput(True)
-            conn.setConnectTimeout(15000)
-            conn.setReadTimeout(15000)
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            out = conn.getOutputStream()
-            out.write(data)
-            out.close()
-            code = conn.getResponseCode()
-            conn.disconnect()
+            code = self.post(data)
             self.plugin.log(f"diagnostics sent ({reason}): HTTP {code}")
             return 200 <= code < 300
         except Exception as e:
             self.plugin.log(f"diagnostics send failed: {e}")
             return False
+
+    def post(self, data: bytes) -> int:
+        conn = URL(LOG_URL).openConnection()
+        conn.setRequestMethod("POST")
+        conn.setDoOutput(True)
+        conn.setConnectTimeout(15000)
+        conn.setReadTimeout(15000)
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        out = conn.getOutputStream()
+        out.write(data)
+        out.close()
+        code = conn.getResponseCode()
+        conn.disconnect()
+        return code
+
+    def send_sdk(self) -> int:
+        sent = 0
+        base = {
+            "session": self.session,
+            "reason": "sdk_dump",
+            "app_version": self.plugin.environment().get("app_version"),
+            "python": sys.version,
+        }
+        for name in SDK_MODULES:
+            try:
+                data = json.dumps(dict(base, sdk=sdk_snapshot(name)), ensure_ascii=False).encode("utf-8")
+                if 200 <= self.post(data) < 300:
+                    sent += 1
+            except Exception as e:
+                self.plugin.log(f"sdk dump of {name} failed: {e}")
+        return sent
+
+
+def describe_member(obj) -> str:
+    try:
+        return str(inspect.signature(obj))
+    except Exception:
+        return ""
+
+
+def sdk_snapshot(name: str) -> dict:
+    try:
+        module = importlib.import_module(name)
+    except Exception as e:
+        return {"module": name, "import_error": repr(e)}
+    info = {"module": name, "file": getattr(module, "__file__", None)}
+    for attr in ("__version__", "__sdk_version__", "SDK_VERSION", "VERSION"):
+        if hasattr(module, attr):
+            info[attr] = str(getattr(module, attr))
+    try:
+        source = inspect.getsource(module)
+        info["source"] = source[:SDK_SOURCE_MAX]
+        info["source_truncated"] = len(source) > SDK_SOURCE_MAX
+        return info
+    except Exception as e:
+        info["source_error"] = repr(e)
+    members = {}
+    for member_name, member in vars(module).items():
+        if member_name.startswith("_"):
+            continue
+        if inspect.isclass(member):
+            members[member_name] = {
+                attr: describe_member(value)
+                for attr, value in vars(member).items()
+                if callable(value) and not attr.startswith("__")
+            }
+        elif callable(member):
+            members[member_name] = describe_member(member)
+    info["members"] = members
+    return info
 
 
 class PluginHook(MethodHook):
@@ -660,6 +726,16 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _send_sdk(self, *_):
+        def worker():
+            sent = self.diag.send_sdk()
+            if sent:
+                BulletinHelper.show_success(f"Сведения об SDK отправлены: {sent} из {len(SDK_MODULES)} модулей")
+            else:
+                BulletinHelper.show_error("Не удалось отправить сведения об SDK")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def create_settings(self) -> List[Any]:
         return [
             Header(text="AV1"),
@@ -716,6 +792,11 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 text="Отправить лог сейчас",
                 icon="msg_retry",
                 on_click=self._send_now,
+            ),
+            Text(
+                text="Отправить сведения об SDK",
+                icon="msg_info",
+                on_click=self._send_sdk,
             ),
             Divider(text=self._status_text()),
         ]
