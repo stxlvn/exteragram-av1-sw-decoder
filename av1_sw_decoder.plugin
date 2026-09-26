@@ -30,7 +30,7 @@ __description__ = (
     "Может также включать программный декодер для HEVC."
 )
 __author__ = "stxlvn"
-__version__ = "1.0.2"
+__version__ = "1.0.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -734,6 +734,10 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             f"Программные HEVC: {fmt(self.sw_hevc_decoders)}",
             f"Сессия диагностики: {self.diag.session}",
         ]
+        return "\n".join(lines)
+
+    def _warning_text(self) -> str:
+        lines = []
         if not self.sw_decoders:
             lines.append("В системе нет программного AV1-декодера (он есть начиная с Android 10) — AV1-часть плагина ничего не делает.")
         elif self.sw_failed:
@@ -771,8 +775,12 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _toggle_diagnostics(self, *_):
+        self.set_setting("show_diagnostics", not self.get_setting("show_diagnostics", False), reload_settings=True)
+        return True
+
     def create_settings(self) -> List[Any]:
-        return [
+        items = [
             Header(text="AV1"),
             Switch(
                 key="enabled",
@@ -780,6 +788,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 default=True,
                 subtext="Работает только если аппаратного AV1 нет",
                 icon="msg_video",
+                on_long_click=self._toggle_diagnostics,
             ),
             Selector(
                 key="mode",
@@ -815,23 +824,30 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
                 subtext="Если HEVC-видео идёт без картинки или с артефактами на аппаратном декодере",
                 icon="msg_video",
             ),
-            Header(text="Диагностика"),
-            Switch(
-                key="send_logs",
-                text="Отправлять диагностику",
-                default=True,
-                subtext="Модель устройства, кодеки, разрешения и ошибки плеера. Без сообщений, ссылок и имён файлов.",
-                icon="msg_info",
-            ),
-            Text(
-                text="Отправить лог сейчас",
-                icon="msg_retry",
-                on_click=self._send_now,
-            ),
-            Text(
-                text="Отправить сведения об SDK",
-                icon="msg_info",
-                on_click=self._send_sdk,
-            ),
-            Divider(text=self._status_text()),
         ]
+        warning = self._warning_text()
+        if warning:
+            items.append(Divider(text=warning))
+        if self.get_setting("show_diagnostics", False):
+            items += [
+                Header(text="Диагностика"),
+                Switch(
+                    key="send_logs",
+                    text="Отправлять диагностику",
+                    default=True,
+                    subtext="Модель устройства, кодеки, разрешения и ошибки плеера. Без сообщений, ссылок и имён файлов.",
+                    icon="msg_info",
+                ),
+                Text(
+                    text="Отправить лог сейчас",
+                    icon="msg_retry",
+                    on_click=self._send_now,
+                ),
+                Text(
+                    text="Отправить сведения об SDK",
+                    icon="msg_info",
+                    on_click=self._send_sdk,
+                ),
+                Divider(text=self._status_text()),
+            ]
+        return items
