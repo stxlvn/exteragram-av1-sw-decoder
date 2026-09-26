@@ -30,7 +30,7 @@ __description__ = (
     "Может также включать программный декодер для HEVC."
 )
 __author__ = "stxlvn"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -250,13 +250,29 @@ class Diagnostics:
             "app_version": self.plugin.environment().get("app_version"),
             "python": sys.version,
         }
-        for name in SDK_MODULES:
+        batch = []
+
+        def flush():
+            nonlocal sent
+            if not batch:
+                return
             try:
-                data = json.dumps(dict(base, sdk=sdk_snapshot(name)), ensure_ascii=False).encode("utf-8")
+                data = json.dumps(dict(base, sdk_modules=batch), ensure_ascii=False).encode("utf-8")
                 if 200 <= self.post(data) < 300:
-                    sent += 1
+                    sent += len(batch)
             except Exception as e:
-                self.plugin.log(f"sdk dump of {name} failed: {e}")
+                self.plugin.log(f"sdk dump failed: {e}")
+            batch.clear()
+
+        for name in SDK_MODULES:
+            snapshot = sdk_snapshot(name)
+            size = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+            if batch and len(json.dumps(batch + [snapshot], ensure_ascii=False).encode("utf-8")) > LOG_PAYLOAD_MAX:
+                flush()
+            batch.append(snapshot)
+            if size > LOG_PAYLOAD_MAX:
+                flush()
+        flush()
         return sent
 
 
@@ -552,6 +568,7 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         self.hw_decoders, self.sw_decoders = [], []
         self.hw_hevc_decoders, self.sw_hevc_decoders = [], []
         self.hook_status = {}
+        self.unhooks = []
         self.diag = Diagnostics(self)
         self.token = self.diag.session
         previous = getattr(sys, OWNER_ATTR, None)
@@ -568,6 +585,12 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
         if getattr(sys, OWNER_ATTR, None) == self.token:
             setattr(sys, OWNER_ATTR, None)
         self.diag.cancel()
+        for unhook in self.unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self.unhooks = []
 
     def is_current(self) -> bool:
         return getattr(sys, OWNER_ATTR, None) == self.token
@@ -590,39 +613,39 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             return
 
         string_class = load_class("java.lang.String")
-        self._hook("VideoPlayer.supportsHardwareDecoder", lambda: self.hook_method(
+        self._hook("VideoPlayer.supportsHardwareDecoder", lambda: self._hook_one(
             video_player.getDeclaredMethod("supportsHardwareDecoder", string_class),
             SupportsDecoderHook(self),
         ))
         self._hook("VideoPlayer.getQualities",
-                   lambda: self.hook_all_methods(video_player, "getQualities", QualitiesHook(self)))
+                   lambda: self._hook_declared(video_player, "getQualities", QualitiesHook(self)))
         self._hook("VideoPlayer.getQualityForPlayer",
-                   lambda: self.hook_all_methods(video_player, "getQualityForPlayer", QualityForPlayerHook(self)))
+                   lambda: self._hook_declared(video_player, "getQualityForPlayer", QualityForPlayerHook(self)))
         self._hook("VideoPlayer.onPlayerError",
-                   lambda: self.hook_all_methods(video_player, "onPlayerError", PlayerErrorHook(self)))
+                   lambda: self._hook_declared(video_player, "onPlayerError", PlayerErrorHook(self)))
         self._hook("VideoPlayer.onRenderedFirstFrame",
-                   lambda: self.hook_all_methods(video_player, "onRenderedFirstFrame", FirstFrameHook(self)))
+                   lambda: self._hook_declared(video_player, "onRenderedFirstFrame", FirstFrameHook(self)))
         self._hook("VideoPlayer.onTracksChanged",
-                   lambda: self.hook_all_methods(video_player, "onTracksChanged", TracksHook(self)))
+                   lambda: self._hook_declared(video_player, "onTracksChanged", TracksHook(self)))
         for event in ("onPlayerStateChanged", "onVideoSizeChanged", "preparePlayer"):
             self._hook(f"VideoPlayer.{event}",
-                       lambda event=event: self.hook_all_methods(video_player, event, PlayerEventHook(self, event)))
+                       lambda event=event: self._hook_declared(video_player, event, PlayerEventHook(self, event)))
         video_renderer = load_any_class("video.MediaCodecVideoRenderer")
         if video_renderer is None:
             self.hook_status["MediaCodecVideoRenderer"] = "class not found"
         else:
             self._hook("MediaCodecVideoRenderer.supportsFormat",
-                       lambda: self.hook_all_methods(video_renderer, "supportsFormat", RendererSupportHook(self)))
+                       lambda: self._hook_declared(video_renderer, "supportsFormat", RendererSupportHook(self)))
             self._hook("MediaCodecVideoRenderer.onCodecInitialized",
-                       lambda: self.hook_all_methods(video_renderer, "onCodecInitialized", CodecInitializedHook(self)))
+                       lambda: self._hook_declared(video_renderer, "onCodecInitialized", CodecInitializedHook(self)))
             self._hook("MediaCodecVideoRenderer.onCodecError",
-                       lambda: self.hook_all_methods(video_renderer, "onCodecError", CodecErrorHook(self)))
+                       lambda: self._hook_declared(video_renderer, "onCodecError", CodecErrorHook(self)))
 
         codec_util = load_any_class("mediacodec.MediaCodecUtil")
         if codec_util is None:
             self.hook_status["MediaCodecUtil"] = "class not found"
         else:
-            self._hook("MediaCodecUtil.getDecoderInfos", lambda: self.hook_method(
+            self._hook("MediaCodecUtil.getDecoderInfos", lambda: self._hook_one(
                 codec_util.getDeclaredMethod("getDecoderInfos", string_class, Boolean.TYPE, Boolean.TYPE),
                 DecoderInfosHook(self),
             ))
@@ -632,15 +655,27 @@ class AV1SoftwareDecoderPlugin(BasePlugin):
             self.hook_status["DefaultRenderersFactory"] = "class not found"
         else:
             self._hook("DefaultRenderersFactory.<init>",
-                       lambda: self.hook_all_constructors(renderers_factory, RenderersFactoryHook(self)))
+                       lambda: self._hook_constructors(renderers_factory, RenderersFactoryHook(self)))
         self.diag.add(f"hooks: {self.hook_status}")
 
     def _hook(self, label, install):
         try:
-            result = install()
-            self.hook_status[label] = f"ok ({len(result)})" if isinstance(result, list) else ("ok" if result is not None else "none")
+            count = install()
+            self.hook_status[label] = f"ok ({count})" if count else "no methods"
         except Exception as e:
             self.hook_status[label] = f"error: {e}"
+
+    def _hook_one(self, member, handler) -> int:
+        unhook = self.hook_method(member, handler)
+        if unhook is not None:
+            self.unhooks.append(unhook)
+        return 1
+
+    def _hook_declared(self, cls, name, handler) -> int:
+        return sum(self._hook_one(m, handler) for m in cls.getDeclaredMethods() if m.getName() == name and not m.isBridge())
+
+    def _hook_constructors(self, cls, handler) -> int:
+        return sum(self._hook_one(c, handler) for c in cls.getDeclaredConstructors())
 
     def environment(self) -> dict:
         env = {
